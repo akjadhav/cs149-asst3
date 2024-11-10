@@ -27,6 +27,32 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void
+upsweep_kernel(int * data, int N, int two_d, int two_dplus1) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = index * two_dplus1;
+    if (idx < N) {
+        data[idx + two_dplus1 - 1] += data[idx + two_d - 1];
+    }
+
+}
+
+__global__ void 
+downsweep_kernel(int* data, int N, int two_d, int two_dplus1) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = index * two_dplus1;
+    if (idx < N) {
+        int t = data[idx + two_d - 1];
+        data[idx + two_d - 1] = data[idx + two_dplus1 - 1];
+        data[idx + two_dplus1 - 1] += t;
+    }
+}
+
+__global__ void 
+set_zero(int * data, int N) {
+    data[N - 1] = 0;
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -53,8 +79,35 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    N = nextPow2(N);
 
+    int two_d;
+    int two_dplus1;
 
+    // upsweep
+    for (two_d = 1; two_d < N; two_d *= 2) {
+        two_dplus1 = 2 * two_d;
+        int num_threads = N / two_dplus1;
+        int blocks = (num_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        int threads_blocks = blocks == 1 ? num_threads : THREADS_PER_BLOCK;
+        upsweep_kernel<<<blocks, threads_blocks>>>(result, N, two_d, two_dplus1);
+        cudaDeviceSynchronize();
+    }
+
+    // set last element to zero
+    set_zero<<<1, 1>>>(result, N);
+    cudaDeviceSynchronize();
+
+    // downsweep
+    for (two_d = N / 2; two_d >= 1; two_d /= 2) {
+        two_dplus1 = 2 * two_d;
+        int num_threads = N / two_dplus1;
+        int blocks = (num_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        int threads_blocks = blocks == 1 ? num_threads : THREADS_PER_BLOCK;
+
+        downsweep_kernel<<<blocks, threads_blocks>>>(result, N, two_d, two_dplus1);
+        cudaDeviceSynchronize();
+    }
 }
 
 
@@ -140,6 +193,34 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void 
+mark_repeats(int* input, int*repeats, int length, int* flags, int* outputs) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < length - 1) {
+        if (input[index] == input[index + 1]) {
+            flags[index] = 1;
+            repeats[index] = index;
+	    outputs[index] = 1;
+        } else {
+            flags[index] = 0;
+            repeats[index] = 0;
+	    outputs[index] = 0;
+        }
+    }
+    if (index == length - 1) {
+        repeats[index] = 0;
+        flags[index] = 0;
+	outputs[index] = 0;
+    }
+}
+
+__global__ void 
+find_repeats(int* repeats, int *scan_results, int* output, int length, int* flags) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < length - 1 && flags[index] == 1) {
+        output[scan_results[index]] = repeats[index];
+    }
+}
 
 // find_repeats --
 //
@@ -160,8 +241,38 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+ 
 
-    return 0; 
+    int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    int N = nextPow2(length);
+    int* flags = nullptr;
+    int* repeats = nullptr;
+    int* scan_results = nullptr;
+
+    cudaMalloc((void **)&flags, N * sizeof(int));
+    cudaMalloc((void **)&repeats, N * sizeof(int));
+    cudaMalloc((void**)&scan_results, N * sizeof(int));
+
+    mark_repeats<<<blocks, THREADS_PER_BLOCK>>>(device_input, repeats, length, flags, scan_results);
+    cudaDeviceSynchronize();
+
+    exclusive_scan(flags, length, scan_results);
+    cudaDeviceSynchronize();
+
+
+    find_repeats<<<blocks, THREADS_PER_BLOCK>>>(repeats, scan_results, device_output, length, flags);
+    int last_scan = 0;
+    int last_flag = 0;
+    cudaMemcpy(&last_scan, &scan_results[N - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&last_flag, &flags[N - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    int num_repeats = last_scan + last_flag;
+
+    cudaFree(flags);
+    cudaFree(repeats);
+    cudaFree(scan_results);
+
+    return num_repeats;
+ 
 }
 
 
